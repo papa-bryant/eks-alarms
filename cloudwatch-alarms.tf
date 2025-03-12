@@ -1,21 +1,41 @@
-
-# Create a new SNS topic for alerts
-resource "aws_sns_topic" "pod_resource_alerts" {
-  name = "eks-pod-resource-alerts"
+# Required Terraform providers
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.0"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
+  }
 }
 
-# Subscribe an email address to the SNS topic
-resource "aws_sns_topic_subscription" "email_subscription" {
-  topic_arn = aws_sns_topic.pod_resource_alerts.arn
-  protocol  = "email"
-  endpoint  = "bryantkiseu@gmail.com"  # Replace with your actual email address
+# External data source to execute script and get file path
+data "external" "kubernetes_services_file" {
+  program = ["bash", "${path.module}/scripts/get_services.sh", var.cluster_name, var.namespace]
 }
 
-# Locals to define services and metrics to monitor
+# Read the file produced by the script
+data "local_file" "kubernetes_services" {
+  filename = data.external.kubernetes_services_file.result.file_path
+  depends_on = [data.external.kubernetes_services_file]
+}
+
+# Locals for service discovery and alarm configuration
 locals {
-  cluster_name = "eks-cluster"
-  namespace    = "test-services"
-  services     = ["service1", "service2"]
+  # Parse the JSON from the file
+  services_data = jsondecode(data.local_file.kubernetes_services.content)
+  error_message = local.services_data.error
+  services = local.services_data.services
+  
+  # Default to a fallback service if none discovered
+  actual_services = length(local.services) > 0 ? local.services : ["default-service"]
   
   # Define metrics to monitor
   metrics = {
@@ -31,92 +51,91 @@ locals {
     }
   }
   
-  # Create a flattened list of all service-metric combinations
-  monitoring_pairs = flatten([
-    for service in local.services : [
-      for metric_key, metric in local.metrics : {
-        service         = service
-        metric_key      = metric_key
-        metric_name     = metric.metric_name
-        alarm_name      = "${service}-${metric.alarm_name_prefix}"
-        description     = "This metric monitors ${service} ${metric.description}"
-      }
-    ]
-  ])
+  # Create static mapping for all service-metric combinations
+  service_metric_keys = {
+    for pair in flatten([
+      for service in local.actual_services : [
+        for metric_key, metric in local.metrics : {
+          key           = "${service}-${metric_key}"
+          service       = service
+          metric_key    = metric_key
+          metric_name   = metric.metric_name
+          alarm_prefix  = metric.alarm_name_prefix
+          description   = metric.description
+        }
+      ]
+    ]) : pair.key => pair
+  }
+}
+
+# Create a new SNS topic for alerts
+resource "aws_sns_topic" "pod_resource_alerts" {
+  name = "eks-pod-resource-alerts"
+}
+
+# Subscribe an email address to the SNS topic
+resource "aws_sns_topic_subscription" "email_subscription" {
+  topic_arn = aws_sns_topic.pod_resource_alerts.arn
+  protocol  = "email"
+  endpoint  = var.email
 }
 
 # Create all alarms using for_each
 resource "aws_cloudwatch_metric_alarm" "pod_resource_alarms" {
-  for_each = { for pair in local.monitoring_pairs : "${pair.service}-${pair.metric_key}" => pair }
+  for_each = local.service_metric_keys
   
-  alarm_name          = each.value.alarm_name
+  alarm_name          = "${each.value.service}-${each.value.alarm_prefix}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = each.value.metric_name
-  namespace           = "ContainerInsights"
-  period              = 60
-  statistic           = "Average"
   threshold           = 80
-  alarm_description   = each.value.description
+  alarm_description   = "This metric monitors ${each.value.service} ${each.value.description}"
   
-  dimensions = {
-    ClusterName = local.cluster_name
-    Namespace   = local.namespace
-    Service     = each.value.service
+  metric_query {
+    id          = "m1"
+    return_data = true
+    
+    metric {
+      metric_name = each.value.metric_name
+      namespace   = "ContainerInsights"
+      period      = 60
+      stat        = "Average"
+      
+      dimensions = {
+        ClusterName = var.cluster_name
+        Namespace   = var.namespace
+        Service     = each.value.service
+      }
+    }
   }
   
   alarm_actions = [aws_sns_topic.pod_resource_alerts.arn]
   ok_actions    = [aws_sns_topic.pod_resource_alerts.arn]
 }
 
-# Dashboard to visualize the metrics
-resource "aws_cloudwatch_dashboard" "eks_pod_dashboard" {
-  dashboard_name = "EKS-Pod-Metrics"
-  
-  dashboard_body = jsonencode({
-    widgets = [
-      {
-        type   = "metric"
-        x      = 0
-        y      = 0
-        width  = 12
-        height = 6
-        properties = {
-          metrics = [
-            for service in local.services : 
-              ["ContainerInsights", "pod_memory_utilization_over_pod_limit", "ClusterName", local.cluster_name, "Namespace", local.namespace, "Service", service]
-          ]
-          period = 60
-          stat   = "Average"
-          region = "us-east-1"
-          title  = "Pod Memory Utilization (% of limit)"
-        }
-      },
-      {
-        type   = "metric"
-        x      = 0
-        y      = 6
-        width  = 12
-        height = 6
-        properties = {
-          metrics = [
-            for service in local.services : 
-              ["ContainerInsights", "pod_cpu_utilization_over_pod_limit", "ClusterName", local.cluster_name, "Namespace", local.namespace, "Service", service]
-          ]
-          period = 60
-          stat   = "Average"
-          region = "us-east-1"
-          title  = "Pod CPU Utilization (% of limit)"
-        }
-      }
-    ]
-  })
-}
-
 # Outputs for reference
 output "sns_topic_arn" {
   description = "The ARN of the SNS topic for EKS pod alerts"
   value       = aws_sns_topic.pod_resource_alerts.arn
+}
+
+output "discovery_error" {
+  description = "Error message from service discovery (if any)"
+  value       = local.error_message
+}
+
+output "discovered_services" {
+  description = "Services discovered in the namespace"
+  value       = local.services
+}
+
+output "monitored_services" {
+  description = "Services being monitored (including fallbacks if discovery failed)"
+  value       = local.actual_services
+}
+
+output "file_path" {
+  description = "Path to the services file"
+  value       = data.external.kubernetes_services_file.result.file_path
 }
 
 output "email_subscription" {
@@ -131,5 +150,5 @@ output "alarm_names" {
 
 output "dashboard_url" {
   description = "URL to access the CloudWatch dashboard"
-  value       = "https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=${aws_cloudwatch_dashboard.eks_pod_dashboard.dashboard_name}"
+  value       = "https://${var.region}.console.aws.amazon.com/cloudwatch/home?region=${var.region}#dashboards:name=${aws_cloudwatch_dashboard.eks_service_dashboard.dashboard_name}"
 }
