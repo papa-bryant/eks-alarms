@@ -17,8 +17,13 @@ variable "namespace" {
   default     = "test-services"  # Replace with your actual namespace
 }
 
-variable "email" {
-  description = "Email for alarm notifications"
-  type        = string
-  default     = "test@gmail.com"
+# Variable for multiple email addresses
+variable "alert_emails" {
+  description = "List of email addresses to receive CloudWatch alarm notifications"
+  type        = list(string)
+  default     = [
+    "first.email@gmail.com", # Replace with your emails
+    "second.email@example.com",
+    "third.email@example.com"
+  ]
 }

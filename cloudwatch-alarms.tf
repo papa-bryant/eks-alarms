@@ -68,17 +68,6 @@ locals {
   }
 }
 
-# Create a new SNS topic for alerts
-resource "aws_sns_topic" "pod_resource_alerts" {
-  name = "eks-pod-resource-alerts"
-}
-
-# Subscribe an email address to the SNS topic
-resource "aws_sns_topic_subscription" "email_subscription" {
-  topic_arn = aws_sns_topic.pod_resource_alerts.arn
-  protocol  = "email"
-  endpoint  = var.email
-}
 
 # Create all alarms using for_each
 resource "aws_cloudwatch_metric_alarm" "pod_resource_alarms" {
@@ -136,11 +125,6 @@ output "monitored_services" {
 output "file_path" {
   description = "Path to the services file"
   value       = data.external.kubernetes_services_file.result.file_path
-}
-
-output "email_subscription" {
-  description = "The email subscription for pod alerts"
-  value       = aws_sns_topic_subscription.email_subscription.endpoint
 }
 
 output "alarm_names" {
